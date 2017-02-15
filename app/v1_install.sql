@@ -6,6 +6,7 @@ GRANT CREATE SYNONYM TO TRICKS_ADMIN;
 @@spy_parameters.sql
 @@spy_runs.sql
 @@spy_binds.sql
+@@spy_builtin_type_lengths.sql
 
 @@spy_invocations.sql
 
