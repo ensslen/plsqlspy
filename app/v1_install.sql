@@ -2,6 +2,7 @@
 GRANT CREATE PROCEDURE TO TRICKS_ADMIN;
 GRANT CREATE SYNONYM TO TRICKS_ADMIN;
 
+@@spy_objects.sql
 @@spy_procedures.sql
 @@spy_parameters.sql
 @@spy_runs.sql

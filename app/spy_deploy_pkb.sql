@@ -50,7 +50,7 @@ create or replace PACKAGE BODY spy_deploy AS
       EXECUTE IMMEDIATE 'DROP SYNONYM "'|| synonym_name ||'"';
     END drop_synonym;
 
-    PROCEDURE track_arguments(spy IN spy_procedures%ROWTYPE) AS
+    PROCEDURE track_arguments(spy IN spy_objects%ROWTYPE, spy_proc IN spy_procedures%ROWTYPE) AS
     BEGIN
       MERGE INTO spy_parameters t
         USING (
@@ -60,10 +60,11 @@ create or replace PACKAGE BODY spy_deploy AS
                 ,pls_type data_type
                 ,position
             FROM user_arguments
-            WHERE object_name = spy.procedure_name
+            WHERE object_name = spy_proc.procedure_name
+            AND (package_name = spy.object_name OR spy.object_type <> 'PACKAGE')
         ) s
         ON (t.parameter_name = s.argument_name
-            AND t.procedure_id = spy.procedure_id)
+            AND t.procedure_id = spy_proc.procedure_id)
         WHEN NOT MATCHED THEN INSERT
         (
              parameter_id
@@ -74,7 +75,7 @@ create or replace PACKAGE BODY spy_deploy AS
             ,in_out
         ) VALUES (
             spy_parameters_seq.nextval
-            ,spy.procedure_id
+            ,spy_proc.procedure_id
             ,s.position
             ,s.argument_name
             ,s.data_type
@@ -82,26 +83,77 @@ create or replace PACKAGE BODY spy_deploy AS
         );
    END track_arguments;
 
-    PROCEDURE track_spy (spy IN OUT spy_procedures%ROWTYPE) AS
-
+   PROCEDURE track_procedure (spy IN spy_object%rowtype, spy_proc IN OUT spy_procedures%rowtype) AS
+        
     BEGIN
       SELECT *
-      INTO   spy
+      INTO   spy_proc
       FROM   spy_procedures
-      WHERE procedure_name = spy.procedure_name;
+      WHERE procedure_name = spy_proc.procedure_name
+      AND   object_id = spy_proc.object_id;
       
     EXCEPTION
       WHEN NO_DATA_FOUND THEN
 
           SELECT spy_procedures_seq.NEXTVAL
-          INTO   spy.procedure_id
+          INTO   spy_proc.procedure_id
           FROM   dual;
 
-          INSERT INTO spy_procedures VALUES spy;
+          INSERT INTO spy_procedures VALUES spy_proc;
    
-         track_arguments(spy => spy);
+         track_arguments(spy => spy, spy_proc => spy_proc);
+
+    END track_procedure;
+   
+
+   PROCEDURE track_procedures (spy IN spy_objects%ROWTYPE) AS
+        spy_proc spy_procedures%rowtype;
+    BEGIN
+        spy_proc.object_id := spy.object_id;
+        CASE spy.object_type 
+            WHEN 'PACKAGE' THEN
+                FOR subprocedure IN (
+                    SELECT name
+                        ,type 
+                    FROM user_identifiers ui
+                    WHERE type in ('PROCEDURE', 'FUNCTION')
+                    AND object_type = 'PACKAGE'
+                    AND object_name = spy.object_name
+                    ORDER BY usage_id
+                ) LOOP
+                    spy_proc.procedure_name := subprocedure.name;
+                    spy_proc.procedure_type := subprocedure.type;
+                    track_procedure(spy => spy, spy_proc => spy_proc);
+                END LOOP;
+            ELSE
+                spy_proc.procedure_name := spy.object_name;
+                spy_proc.procedure_type := spy.object_type;
+                track_procedure(spy => spy, spy_proc => spy_proc);
+        END CASE;
+    END track_procedures;
+    
+
+    PROCEDURE track_spy (spy IN OUT spy_objects%ROWTYPE) AS
+
+    BEGIN
+      SELECT *
+      INTO   spy
+      FROM   spy_objects
+      WHERE object_name = spy.object_name;
+      
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+
+          SELECT spy_objects_seq.NEXTVAL
+          INTO   spy.object_id
+          FROM   dual;
+
+          INSERT INTO spy_objects VALUES spy;
+   
+         track_procedures(spy => spy);
 
     END track_spy;
+    
 
     FUNCTION get_source(object_name ora_name) RETURN VARCHAR2 AS
       src VARCHAR_MAX;
@@ -160,7 +212,7 @@ create or replace PACKAGE BODY spy_deploy AS
       drop_procedure(proc_name =>old_name, proc_type => object_type);
     END rename_procedure;
 
-    FUNCTION generate_spy (spy spy_procedures%rowtype) RETURN VARCHAR2 AS
+    FUNCTION generate_spy (spy spy_objects%ROWTYPE, spy_proc spy_procedures%ROWTYPE) RETURN VARCHAR2 AS
       spy_source    VARCHAR_MAX;
       declaration   VARCHAR_MAX := '';
       inputs        VARCHAR_MAX := '';
@@ -173,7 +225,7 @@ create or replace PACKAGE BODY spy_deploy AS
         SELECT declaration, inputs, invocation, outputs, return_type, return_length
         INTO declaration, inputs, invocation, outputs, return_type, return_length
         FROM spy_invocations
-        WHERE procedure_id = spy.procedure_id;
+        WHERE procedure_id = spy_proc.procedure_id;
       EXCEPTION
       WHEN NO_DATA_FOUND THEN
         -- If there are no parameters, then nothing needs to be done
@@ -182,41 +234,41 @@ create or replace PACKAGE BODY spy_deploy AS
       
       CASE spy.procedure_type 
         WHEN  'FUNCTION' THEN
-      spy_source := 'CREATE FUNCTION '|| spy.spy_procedure_name || declaration||' RETURN '||return_type||' AS
+      spy_source := 'CREATE FUNCTION '|| spy.spy_object_name || declaration||' RETURN '||return_type||' AS
         PRAGMA AUTONOMOUS_TRANSACTION;
         return_value '||return_type||coalesce('('||return_length||')','')||';
         run_id INT; 
       BEGIN 
         /* This function was generated by plsqlspy at '|| to_char(sysdate,'YYYY-MON-DD HH24:MI') ||'
            Please edit the generator, plsqlspy, if changes to this function are desired. */
-        spy_record.called('||spy.procedure_id||', run_id);
+        spy_record.called('||spy_proc.procedure_id||', run_id);
         '|| inputs || '
-        SELECT '|| spy.raw_procedure_name ||'('||invocation||') INTO return_value FROM dual;
+        SELECT '|| spy.raw_object_name ||'('||invocation||') INTO return_value FROM dual;
         '|| outputs || '
         spy_record.done(run_Id => run_id);
         COMMIT; /* Required to avoid ORA-06519: active autonomous transaction detected and rolled back */
         RETURN return_value;
-      END '|| spy.spy_procedure_name||';';
+      END '|| spy.spy_object_name||';';
         
         WHEN 'PROCEDURE' THEN
-      spy_source := 'CREATE PROCEDURE '|| spy.spy_procedure_name || declaration||' AS 
+      spy_source := 'CREATE PROCEDURE '|| spy.spy_object_name || declaration||' AS 
         run_id INT; 
       BEGIN 
         /* This procedure was generated by plsqlspy at '|| to_char(sysdate,'YYYY-MON-DD HH24:MI') ||'
            Please edit the generator, plsqlspy, if changes to this procedure are desired. */
-        spy_record.called('||spy.procedure_id||', run_id);
+        spy_record.called('||spy_proc.procedure_id||', run_id);
         '|| inputs || '
-        '|| spy.raw_procedure_name ||'('||invocation||');
+        '|| spy.raw_object_name ||'('||invocation||');
         '|| outputs || '
         spy_record.done(run_Id => run_id);
-      END '|| spy.spy_procedure_name||';';
+      END '|| spy.spy_object_name||';';
       END CASE;
       
       RETURN spy_source;
     END generate_spy;
 
 
-    PROCEDURE create_spy (spy spy_procedures%rowtype) AS
+    PROCEDURE create_spy (spy spy_objects%ROWTYPE) AS
       spy_source VARCHAR_MAX;
     BEGIN
       spy_source := generate_spy (spy => spy);
@@ -225,38 +277,38 @@ create or replace PACKAGE BODY spy_deploy AS
 
 
 	PROCEDURE set_up (procedure_name ora_name, object_type ora_name) AS
-      spy spy_procedures%rowtype;
+      spy spy_objects%ROWTYPE;
 	BEGIN
       assert(check_exists(name => procedure_name));
-	  spy.procedure_name := procedure_name;
+	  spy.object_name := procedure_name;
       spy.procedure_type := object_type;
-      spy.raw_procedure_name := make_new_name(base_name => procedure_name, prefix => raw_prefix);
-	  spy.spy_procedure_name := make_new_name(base_name => procedure_name, prefix => spy_prefix);
+      spy.raw_object_name := make_new_name(base_name => procedure_name, prefix => raw_prefix);
+	  spy.spy_object_name := make_new_name(base_name => procedure_name, prefix => spy_prefix);
       track_spy(spy => spy);
-      rename_procedure(old_name => procedure_name, new_name => spy.raw_procedure_name, object_type => spy.procedure_type);
+      rename_procedure(old_name => procedure_name, new_name => spy.raw_object_name, object_type => spy.procedure_type);
       create_spy(spy => spy);
-      create_synonym(synonym_name => procedure_name, object_name => spy.spy_procedure_name);
+      create_synonym(synonym_name => procedure_name, object_name => spy.spy_object_name);
 	END set_up;
 
-    FUNCTION get_spy(proc_name ora_name) RETURN spy_procedures%rowtype AS
-      spy spy_procedures%rowtype;
+    FUNCTION get_spy(proc_name ora_name) RETURN spy_objects%ROWTYPE AS
+      spy spy_objects%ROWTYPE;
     BEGIN
       SELECT * 
       INTO spy
-      FROM spy_procedures
-      WHERE procedure_name = proc_name;
+      FROM spy_objects
+      WHERE object_name = proc_name;
 
       RETURN spy;
     END get_spy;
 
 	PROCEDURE tear_down (procedure_name ORA_NAME) AS
-	  spy spy_procedures%rowtype;
+	  spy spy_objects%ROWTYPE;
     BEGIN
       assert(check_exists(name => procedure_name));
 	  spy := get_spy(proc_name => procedure_name);
-      drop_procedure(proc_name => spy.spy_procedure_name, proc_type => spy.procedure_type );
+      drop_procedure(proc_name => spy.spy_object_name, proc_type => spy.procedure_type );
       drop_synonym(synonym_name => spy.procedure_name);
-      rename_procedure(old_name => spy.raw_procedure_name, new_name => spy.procedure_name,object_type => spy.procedure_type);
+      rename_procedure(old_name => spy.raw_object_name, new_name => spy.procedure_name,object_type => spy.procedure_type);
 	END tear_down;
 
 END spy_deploy;
