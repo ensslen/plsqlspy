@@ -3,21 +3,22 @@ create or replace PACKAGE BODY spy_deploy AS
     SUBTYPE VARCHAR_MAX IS VARCHAR2(32767); 
 
    Procedure Assert (invariant BOOLEAN
-   , message In Varchar2 default 'Assertion Failed') Is
-   Begin
-      If (not invariant) Then
+   , message In Varchar2 default 'Assertion Failed') AS
+   BEGIN
+      IF (not invariant) Then
         Raise_Application_Error(-20001, message);
-      End If;
-   End Assert;
+      END IF;
+   END Assert;
 
-    -- Might need a version that checks object_types too
-	FUNCTION check_exists (name ORA_NAME) RETURN BOOLEAN AS
+	FUNCTION check_exists (obj_name ORA_NAME
+        , obj_type VARCHAR2 DEFAULT NULL) RETURN BOOLEAN AS
 	  v_exists INT;
 	BEGIN
 		SELECT count(*)
 		INTO v_exists
 		FROM user_objects
-		WHERE object_name = name;
+		WHERE object_name = obj_name
+        AND object_type = coalesce(obj_type,object_type);
 
 		RETURN (v_exists = 1);
 	END check_exists;
@@ -28,7 +29,7 @@ create or replace PACKAGE BODY spy_deploy AS
 	  IF length(prefix||base_name) <= MAX_NAME_LENGTH THEN
 	    candidate := prefix || base_name;
 	  END IF;
-	  WHILE check_exists(name => candidate) LOOP
+	  WHILE check_exists(obj_name => candidate) LOOP
         /* Build a name from the template
         , the seconds and millseconds of the current time
         , and whatever of the name fits */
@@ -155,13 +156,14 @@ create or replace PACKAGE BODY spy_deploy AS
     END track_spy;
     
 
-    FUNCTION get_source(object_name ora_name) RETURN VARCHAR2 AS
+    FUNCTION get_source(object_name ora_name, object_type ora_name) RETURN VARCHAR2 AS
       src VARCHAR_MAX;
     BEGIN
-      SELECT listagg(text,CHR(10)) WITHIN GROUP (ORDER BY line) 
+      SELECT listagg(text,'') WITHIN GROUP (ORDER BY line) 
       INTO src
       FROM user_source
-      WHERE name = object_name;
+      WHERE name = object_name
+      AND type = object_type;
       RETURN src;
     END get_source;
 
@@ -191,9 +193,9 @@ create or replace PACKAGE BODY spy_deploy AS
     END replace_word;
 
 
-    FUNCTION generate_rename_ddl(old_name ora_name, new_name ora_name) RETURN VARCHAR2 AS
+    FUNCTION generate_rename_ddl(old_name ora_name, new_name ora_name, object_type ora_name) RETURN VARCHAR2 AS
     BEGIN
-      RETURN 'CREATE '|| replace_word(subject => get_source(object_name => old_name)
+      RETURN 'CREATE '|| replace_word(subject => get_source(object_name => old_name, object_type => object_type)
         ,find => old_name
         ,replace => new_name);
      END generate_rename_ddl;
@@ -207,15 +209,30 @@ create or replace PACKAGE BODY spy_deploy AS
     PROCEDURE rename_procedure(old_name ora_name, new_name ora_name, object_type ora_name) AS
       procedure_source VARCHAR_MAX;
     BEGIN
-      procedure_source := generate_rename_ddl(old_name => old_name,new_name => new_name);
-      EXECUTE IMMEDIATE procedure_source;
+      IF object_type = 'PACKAGE' THEN
+          procedure_source := generate_rename_ddl(old_name => old_name,new_name => new_name, object_type => 'PACKAGE');
+          EXECUTE IMMEDIATE procedure_source;
+
+          procedure_source := generate_rename_ddl(old_name => old_name,new_name => new_name, object_type => 'PACKAGE BODY');
+          EXECUTE IMMEDIATE procedure_source;
+      ELSE
+          procedure_source := generate_rename_ddl(old_name => old_name,new_name => new_name,  object_type => object_type);
+          EXECUTE IMMEDIATE procedure_source;
+      END IF;
+      
       drop_procedure(proc_name =>old_name, proc_type => object_type);
     END rename_procedure;
 
     FUNCTION generate_spy_procs (spy spy_objects%ROWTYPE) RETURN VARCHAR2 AS
-      spy_source    VARCHAR_MAX;
+      declaration       VARCHAR_MAX;
+      spy_source        VARCHAR_MAX := 'CREATE ';
+      raw_name          VARCHAR2(61);
       subprocedure_name VARCHAR2(30);
     BEGIN
+    
+      IF spy.object_type LIKE 'PACKAGE%' THEN
+        spy_source := spy_source||' '|| spy.object_type ||' '|| spy.spy_object_name ||' AS'||chr(10);
+      END IF;
     
       FOR spy_proc IN (
         SELECT p.procedure_id 
@@ -224,7 +241,7 @@ create or replace PACKAGE BODY spy_deploy AS
             ,return_type
             ,return_length
             /* procedures with no parameters have no row = null for these */
-            ,coalesce(i.declaration,'') declaration
+            ,i.declaration
             ,coalesce(i.inputs,'') inputs
             ,coalesce(i.invocation,'') invocation
             ,coalesce(i.outputs,'') outputs
@@ -233,64 +250,85 @@ create or replace PACKAGE BODY spy_deploy AS
         WHERE p.object_id = spy.object_id
       ) LOOP
 
-          IF spy.object_type = 'PACKAGE' THEN
+          IF spy.object_type LIKE 'PACKAGE%' THEN
             subprocedure_name := spy_proc.procedure_name;
+            raw_name := spy.raw_object_name||'.'||spy_proc.procedure_name;
           ELSE
             subprocedure_name := spy.spy_object_name;
+            raw_name := spy.raw_object_name;
           END IF;
+          
+          IF 1 < length(spy_proc.declaration) THEN
+            declaration := '('||spy_proc.declaration||')';
+          ELSE
+            declaration := '';
+          END IF;  
+          
+          /* The spy spec is just a declaration */
+          IF spy.object_type = 'PACKAGE' THEN
+            spy_source := spy_source ||' '||spy_proc.procedure_type||' '|| subprocedure_name || declaration;
+            IF spy_proc.procedure_type = 'FUNCTION' THEN 
+                spy_source := spy_source ||' RETURN '||spy_proc.return_type;
+            END IF;
+            spy_source := spy_source ||';'||chr(10);
+          ELSE 
     
-          CASE spy_proc.procedure_type 
-            WHEN  'FUNCTION' THEN
-              spy_source := spy_source ||' FUNCTION '|| subprocedure_name || spy_proc.declaration||' RETURN '||spy_proc.return_type||' AS
-                PRAGMA AUTONOMOUS_TRANSACTION;
-                return_value '||spy_proc.return_type||coalesce('('||spy_proc.return_length||')','')||';
-                run_id INT; 
-              BEGIN 
-                /* This function was generated by plsqlspy at '|| to_char(sysdate,'YYYY-MON-DD HH24:MI') ||'
-                   Please edit the generator, plsqlspy, if changes to this function are desired. */
-                spy_record.called('||spy_proc.procedure_id||', run_id);
-                '|| spy_proc.inputs || '
-                SELECT '|| spy.raw_object_name ||'('||spy_proc.invocation||') INTO return_value FROM dual;
-                '|| spy_proc.outputs || '
-                spy_record.done(run_Id => run_id);
-                COMMIT; /* Required to avoid ORA-06519: active autonomous transaction detected and rolled back */
-                RETURN return_value;
-          END '|| subprocedure_name||';'||chr(10);
-            
-            WHEN 'PROCEDURE' THEN
-              spy_source := ' PROCEDURE '|| subprocedure_name || spy_proc.declaration||' AS
-                run_id INT; 
-              BEGIN 
-                /* This procedure was generated by plsqlspy at '|| to_char(sysdate,'YYYY-MON-DD HH24:MI') ||'
-                   Please edit the generator, plsqlspy, if changes to this function are desired. */
-                spy_record.called('||spy_proc.procedure_id||', run_id);
-                '|| spy_proc.inputs || '
-                '|| spy.raw_object_name ||'('||spy_proc.invocation||');
-                '|| spy_proc.outputs || '
-                spy_record.done(run_Id => run_id);
+              CASE spy_proc.procedure_type 
+                WHEN  'FUNCTION' THEN
+                  spy_source := spy_source ||' FUNCTION '|| subprocedure_name || declaration ||' RETURN '||spy_proc.return_type||' AS
+                    PRAGMA AUTONOMOUS_TRANSACTION;
+                    return_value '||spy_proc.return_type;
+                  IF 0 < spy_proc.return_length THEN
+                    spy_source := spy_source || '('||spy_proc.return_length||')';
+                  END IF;
+                  spy_source := spy_source ||';'||chr(10)||'  run_id INT; 
+                  BEGIN 
+                    /* This function was generated by plsqlspy at '|| to_char(sysdate,'YYYY-MON-DD HH24:MI') ||'
+                       Please edit the generator, plsqlspy, if changes to this function are desired. */
+                    spy_record.called('||spy_proc.procedure_id||', run_id);
+                    '|| spy_proc.inputs || '
+                    return_value := '|| raw_name ||'('||spy_proc.invocation||');
+                    '|| spy_proc.outputs || '
+                    spy_record.done(run_Id => run_id);
+                    COMMIT; /* Required to avoid ORA-06519: active autonomous transaction detected and rolled back */
+                    RETURN return_value;
               END '|| subprocedure_name||';'||chr(10);
-          END CASE;
-      
+                
+                WHEN 'PROCEDURE' THEN
+                  spy_source := spy_source ||' PROCEDURE '|| subprocedure_name || declaration ||' AS
+                    run_id INT; 
+                  BEGIN 
+                    /* This procedure was generated by plsqlspy at '|| to_char(sysdate,'YYYY-MON-DD HH24:MI') ||'
+                       Please edit the generator, plsqlspy, if changes to this function are desired. */
+                    spy_record.called('||spy_proc.procedure_id||', run_id);
+                    '|| spy_proc.inputs || '
+                    '|| raw_name ||'('||spy_proc.invocation||');
+                    '|| spy_proc.outputs || '
+                    spy_record.done(run_Id => run_id);
+                  END '|| subprocedure_name||';'||chr(10);
+              END CASE;
+            END IF;      
       END LOOP;
+      
+      IF spy.object_type LIKE 'PACKAGE%' THEN
+        spy_source := spy_source ||' END '|| spy.spy_object_name ||';';
+      END IF;
       
       RETURN spy_source;
     END generate_spy_procs;
 
 
-    FUNCTION generate_spy_package_spec (spy spy_objects%ROWTYPE) RETURN VARCHAR2 AS
-     spy_source    VARCHAR_MAX;
-    BEGIN
-        RETURN 'UNIMPLEMENTED';
-    END generate_spy_package_spec;
-
     PROCEDURE create_spy (spy spy_objects%ROWTYPE) AS
       spy_source VARCHAR_MAX;
+      body_rec   spy_objects%ROWTYPE;
     BEGIN
+      spy_source := generate_spy_procs (spy => spy);
+      execute immediate spy_source;
+
       IF spy.object_type = 'PACKAGE' THEN
-        NULL;
-      ELSE /* Not a package */
-          spy_source := 'CREATE '|| generate_spy_procs (spy => spy);
-          execute immediate spy_source;        
+          body_rec := spy;
+          body_rec.object_type := 'PACKAGE BODY';
+          create_spy(spy => body_rec);
       END IF;
     END create_spy;
 
@@ -298,7 +336,7 @@ create or replace PACKAGE BODY spy_deploy AS
 	PROCEDURE set_up (procedure_name ora_name, object_type ora_name) AS
       spy spy_objects%ROWTYPE;
 	BEGIN
-      assert(check_exists(name => procedure_name));
+      assert(check_exists(obj_name => procedure_name, obj_type => object_type));
 	  spy.object_name := procedure_name;
       spy.object_type := object_type;
       spy.raw_object_name := make_new_name(base_name => procedure_name, prefix => raw_prefix);
@@ -323,7 +361,7 @@ create or replace PACKAGE BODY spy_deploy AS
 	PROCEDURE tear_down (procedure_name ORA_NAME) AS
 	  spy spy_objects%ROWTYPE;
     BEGIN
-      assert(check_exists(name => procedure_name));
+      assert(check_exists(obj_name => procedure_name, obj_type => 'SYNONYM'));
 	  spy := get_spy(proc_name => procedure_name);
       drop_procedure(proc_name => spy.spy_object_name, proc_type => spy.object_type );
       drop_synonym(synonym_name => spy.object_name);

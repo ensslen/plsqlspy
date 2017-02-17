@@ -1,6 +1,6 @@
 CREATE OR REPLACE VIEW spy_invocations AS
     SELECT procedure_id 
-        ,'('|| listagg( CASE WHEN parameter_position > 0 THEN parameter_name||' '||in_out||' '||sp.data_type ELSE NULL END,',') WITHIN GROUP (ORDER BY parameter_position) ||')' declaration
+        ,listagg( CASE WHEN parameter_position > 0 THEN parameter_name||' '||in_out||' '||sp.data_type ELSE NULL END,',') WITHIN GROUP (ORDER BY parameter_position) declaration
         ,listagg(CASE in_out WHEN 
         'OUT' THEN '' ELSE 'spy_record.put(run_id => run_id, parameter_id =>'|| parameter_id||', bound_value =>'||parameter_name||');' END, chr(10)) 
             WITHIN GROUP (ORDER BY parameter_position) inputs
