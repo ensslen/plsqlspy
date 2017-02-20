@@ -1,6 +1,9 @@
 /* The schema making the spies needs these grants directly, not through a role */
-GRANT CREATE PROCEDURE TO TRICKS_ADMIN;
-GRANT CREATE SYNONYM TO TRICKS_ADMIN;
+BEGIN
+  EXECUTE IMMEDIATE 'GRANT CREATE PROCEDURE TO '||USER;
+  EXECUTE IMMEDIATE 'GRANT CREATE SYNONYM TO '||USER;
+END;
+/
 
 @@spy_objects.sql
 @@spy_procedures.sql
