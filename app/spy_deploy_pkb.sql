@@ -276,7 +276,6 @@ create or replace PACKAGE BODY spy_deploy AS
               CASE spy_proc.procedure_type 
                 WHEN  'FUNCTION' THEN
                   spy_source := spy_source ||' FUNCTION '|| subprocedure_name || declaration ||' RETURN '||spy_proc.return_type||' AS
-                    PRAGMA AUTONOMOUS_TRANSACTION;
                     return_value '||spy_proc.return_type;
                   IF 0 < spy_proc.return_length THEN
                     spy_source := spy_source || '('||spy_proc.return_length||')';
@@ -290,7 +289,6 @@ create or replace PACKAGE BODY spy_deploy AS
                     return_value := '|| raw_name ||'('||spy_proc.invocation||');
                     '|| spy_proc.outputs || '
                     spy_record.done(run_Id => run_id);
-                    COMMIT; /* Required to avoid ORA-06519: active autonomous transaction detected and rolled back */
                     RETURN return_value;
               END '|| subprocedure_name||';'||chr(10);
                 

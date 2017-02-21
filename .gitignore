@@ -2,3 +2,4 @@ app/tests.sql
 app/betwnstr.sql
 app/rename_poc.sql
 app/match_word.sql
+app/oo/*
